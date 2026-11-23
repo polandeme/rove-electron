@@ -64,6 +64,7 @@ jobs:
         run: |
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK_DIR/depot_tools"
           echo "$WORK_DIR/depot_tools" >> "$GITHUB_PATH"
+          DEPOT_TOOLS_UPDATE=1 "$WORK_DIR/depot_tools/ensure_bootstrap"
 
       - name: Sync Electron and Chromium
         run: |
