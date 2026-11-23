@@ -1,0 +1,180 @@
+name: Build Patched Electron (TLS Trust Anchor IDs)
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'patches/**'
+      - '.github/workflows/build-electron.yml'
+  workflow_dispatch:
+    inputs:
+      electron_version:
+        description: Electron tag version (without leading v)
+        required: true
+        default: '45.3.4'
+      target_arch:
+        description: macOS target CPU architecture
+        required: true
+        type: choice
+        default: arm64
+        options:
+          - arm64
+          - x64
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-electron-${{ github.event.inputs.electron_version || '45.3.4' }}-${{ github.event.inputs.target_arch || 'arm64' }}
+  cancel-in-progress: false
+
+jobs:
+  build-macos:
+    runs-on: macos-15
+    timeout-minutes: 360
+    env:
+      ELECTRON_VERSION: ${{ github.event.inputs.electron_version || '45.3.4' }}
+      TARGET_ARCH: ${{ github.event.inputs.target_arch || 'arm64' }}
+      WORK_DIR: ${{ runner.temp }}/electron-build
+      DEPOT_TOOLS_UPDATE: '0'
+    steps:
+      - name: Checkout patches
+        uses: actions/checkout@v4
+
+      - name: Check Xcode and free disk space safely
+        run: |
+          df -h
+          ACTIVE_XCODE=$(xcode-select -p | sed 's|/Contents/Developer||')
+          echo "Active Xcode: $ACTIVE_XCODE"
+          xcodebuild -version
+          for app in /Applications/Xcode*.app; do
+            if [ -d "$app" ] && [ "$app" != "$ACTIVE_XCODE" ] && [ ! -L "$app" ]; then
+              echo "Removing unused $app"
+              sudo rm -rf "$app" || true
+            fi
+          done
+          sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* "$HOME/Library/Android" /usr/local/share/dotnet 2>/dev/null || true
+          df -h
+
+      - name: Install depot_tools
+        run: |
+          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK_DIR/depot_tools"
+          echo "$WORK_DIR/depot_tools" >> "$GITHUB_PATH"
+
+      - name: Sync Electron v${{ env.ELECTRON_VERSION }} and Chromium
+        run: |
+          mkdir -p "$WORK_DIR/src"
+          cd "$WORK_DIR"
+          cat > .gclient <<EOF
+          solutions = [
+            {
+              "name": "src/electron",
+              "url": "https://github.com/electron/electron@v${ELECTRON_VERSION}",
+              "deps_file": "DEPS",
+              "managed": False,
+              "custom_deps": {},
+              "custom_vars": {
+                "checkout_pgo_profiles": False,
+                "checkout_src_internal": False,
+                "checkout_google_benchmark": False,
+                "checkout_telemetry_dependencies": False,
+              },
+            },
+          ]
+          EOF
+          gclient sync --with_branch_heads --with_tags --no-history --shallow --nohooks
+          gclient runhooks
+          df -h
+
+      - name: Apply TLS Trust Anchor IDs patch
+        run: |
+          PATCH_FILE="$GITHUB_WORKSPACE/patches/electron/tls-trust-anchor-ids.patch"
+          cd "$WORK_DIR/src/electron"
+          git apply --check "$PATCH_FILE"
+          git apply "$PATCH_FILE"
+          git diff --stat
+
+      - name: Generate GN build files
+        run: |
+          cd "$WORK_DIR/src"
+          mkdir -p out/Release
+          cat > out/Release/args.gn <<EOF
+          import("//electron/build/args/all.gn")
+          is_debug = false
+          is_component_build = false
+          is_component_ffmpeg = true
+          is_official_build = false
+          dcheck_always_on = false
+          symbol_level = 0
+          blink_symbol_level = 0
+          v8_symbol_level = 0
+          enable_dsyms = false
+          target_cpu = "${TARGET_ARCH}"
+          EOF
+          gn gen out/Release
+
+      - name: Build Electron dist zip
+        run: |
+          cd "$WORK_DIR/src"
+          ninja -C out/Release electron:electron_dist_zip
+          ls -lh out/Release/dist.zip
+          df -h
+
+      - name: Verify built Electron sends TLS extension 0xCA34 (51764)
+        if: env.TARGET_ARCH == 'arm64'
+        run: |
+          VERIFY_DIR="$WORK_DIR/verify"
+          mkdir -p "$VERIFY_DIR"
+          ditto -x -k "$WORK_DIR/src/out/Release/dist.zip" "$VERIFY_DIR"
+          cat > "$VERIFY_DIR/check-tls.cjs" <<'EOF'
+          const { app, BrowserWindow, session } = require('electron');
+          app.on('window-all-closed', () => {});
+          app.whenReady().then(async () => {
+            const ses = session.fromPartition('ci-tls-check');
+            const win = new BrowserWindow({ show: false, webPreferences: { session: ses, sandbox: true } });
+            try {
+              await win.loadURL('https://tls.peet.ws/api/all');
+              const raw = await win.webContents.mainFrame.executeJavaScript('document.body.innerText');
+              const data = JSON.parse(raw);
+              const has51764 = (data.tls?.extensions || []).some(e => /51764|trust_anchor/i.test(e.name));
+              console.log('JA4:', data.tls?.ja4, 'HAS_51764:', has51764);
+              win.destroy();
+              app.exit(has51764 ? 0 : 1);
+            } catch (err) {
+              console.error(err);
+              app.exit(1);
+            }
+          });
+          EOF
+          "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs"
+
+      - name: Package artifact and checksum
+        run: |
+          OUT_DIR="$WORK_DIR/artifacts"
+          mkdir -p "$OUT_DIR"
+          ZIP_NAME="electron-v${ELECTRON_VERSION}-darwin-${TARGET_ARCH}.zip"
+          cp "$WORK_DIR/src/out/Release/dist.zip" "$OUT_DIR/$ZIP_NAME"
+          (cd "$OUT_DIR" && shasum -a 256 "$ZIP_NAME" > SHASUMS256.txt)
+          cat "$OUT_DIR/SHASUMS256.txt"
+
+      - name: Upload Actions artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: electron-v${{ env.ELECTRON_VERSION }}-darwin-${{ env.TARGET_ARCH }}
+          path: ${{ env.WORK_DIR }}/artifacts/*
+          retention-days: 30
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="v${ELECTRON_VERSION}-tai"
+          OUT_DIR="$WORK_DIR/artifacts"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "$OUT_DIR"/* --clobber
+          else
+            gh release create "$TAG" "$OUT_DIR"/* \
+              --title "Electron v${ELECTRON_VERSION} (TLS Trust Anchor IDs)" \
+              --notes "Patched Electron v${ELECTRON_VERSION} populating compiled-in Chrome Root Store TLS Trust Anchor IDs (0xCA34 / 51764)."
+          fi
