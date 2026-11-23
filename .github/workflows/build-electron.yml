@@ -26,7 +26,7 @@ permissions:
   contents: write
 
 concurrency:
-  group: build-electron-${{ github.event.inputs.electron_version || '45.3.4' }}-${{ github.event.inputs.target_arch || 'arm64' }}
+  group: build-electron-${{ inputs.electron_version || '45.3.4' }}-${{ inputs.target_arch || 'arm64' }}
   cancel-in-progress: false
 
 jobs:
@@ -34,13 +34,16 @@ jobs:
     runs-on: macos-15
     timeout-minutes: 360
     env:
-      ELECTRON_VERSION: ${{ github.event.inputs.electron_version || '45.3.4' }}
-      TARGET_ARCH: ${{ github.event.inputs.target_arch || 'arm64' }}
-      WORK_DIR: ${{ runner.temp }}/electron-build
+      ELECTRON_VERSION: ${{ inputs.electron_version || '45.3.4' }}
+      TARGET_ARCH: ${{ inputs.target_arch || 'arm64' }}
       DEPOT_TOOLS_UPDATE: '0'
     steps:
       - name: Checkout patches
         uses: actions/checkout@v4
+
+      - name: Initialize build directory
+        run: |
+          echo "WORK_DIR=${RUNNER_TEMP}/electron-build" >> "$GITHUB_ENV"
 
       - name: Check Xcode and free disk space safely
         run: |
@@ -62,7 +65,7 @@ jobs:
           git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK_DIR/depot_tools"
           echo "$WORK_DIR/depot_tools" >> "$GITHUB_PATH"
 
-      - name: Sync Electron v${{ env.ELECTRON_VERSION }} and Chromium
+      - name: Sync Electron and Chromium
         run: |
           mkdir -p "$WORK_DIR/src"
           cd "$WORK_DIR"
