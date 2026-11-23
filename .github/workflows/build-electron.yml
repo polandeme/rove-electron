@@ -67,6 +67,7 @@ jobs:
 
       - name: Sync Electron and Chromium
         run: |
+          set -o pipefail
           mkdir -p "$WORK_DIR/src"
           cd "$WORK_DIR"
           cat > .gclient <<EOF
@@ -86,20 +87,24 @@ jobs:
             },
           ]
           EOF
-          gclient sync --with_branch_heads --with_tags --no-history --shallow --nohooks
-          gclient runhooks
+          gclient sync --with_branch_heads --with_tags --no-history --shallow --nohooks 2>&1 | tee "$WORK_DIR/last-step.log"
+          gclient runhooks 2>&1 | tee -a "$WORK_DIR/last-step.log"
           df -h
 
-      - name: Apply TLS Trust Anchor IDs patch
+      - name: Install Electron JS dependencies and apply TLS Trust Anchor IDs patch
         run: |
+          set -o pipefail
           PATCH_FILE="$GITHUB_WORKSPACE/patches/electron/tls-trust-anchor-ids.patch"
           cd "$WORK_DIR/src/electron"
+          git pack-refs --all
+          node script/yarn.js install --immutable --mode=skip-build 2>&1 | tee "$WORK_DIR/last-step.log"
           git apply --check "$PATCH_FILE"
           git apply "$PATCH_FILE"
           git diff --stat
 
       - name: Generate GN build files
         run: |
+          set -o pipefail
           cd "$WORK_DIR/src"
           mkdir -p out/Release
           cat > out/Release/args.gn <<EOF
@@ -112,21 +117,23 @@ jobs:
           symbol_level = 0
           blink_symbol_level = 0
           v8_symbol_level = 0
-          enable_dsyms = false
+          override_electron_version = "${ELECTRON_VERSION}"
           target_cpu = "${TARGET_ARCH}"
           EOF
-          gn gen out/Release
+          gn gen out/Release 2>&1 | tee "$WORK_DIR/last-step.log"
 
       - name: Build Electron dist zip
         run: |
+          set -o pipefail
           cd "$WORK_DIR/src"
-          ninja -C out/Release electron:electron_dist_zip
+          ninja -C out/Release electron:electron_dist_zip 2>&1 | tee "$WORK_DIR/last-step.log"
           ls -lh out/Release/dist.zip
           df -h
 
       - name: Verify built Electron sends TLS extension 0xCA34 (51764)
         if: env.TARGET_ARCH == 'arm64'
         run: |
+          set -o pipefail
           VERIFY_DIR="$WORK_DIR/verify"
           mkdir -p "$VERIFY_DIR"
           ditto -x -k "$WORK_DIR/src/out/Release/dist.zip" "$VERIFY_DIR"
@@ -150,7 +157,21 @@ jobs:
             }
           });
           EOF
-          "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs"
+          "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs" 2>&1 | tee "$WORK_DIR/last-step.log"
+
+      - name: Upload failure diagnostic log
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f "$WORK_DIR/last-step.log" ]; then
+            tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
+            if gh release view ci-debug-log >/dev/null 2>&1; then
+              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
+            else
+              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
+            fi
+          fi
 
       - name: Package artifact and checksum
         run: |
