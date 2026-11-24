@@ -31,7 +31,7 @@ concurrency:
 
 jobs:
   build-macos:
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 360
     env:
       ELECTRON_VERSION: ${{ inputs.electron_version || '45.3.4' }}
@@ -48,9 +48,14 @@ jobs:
       - name: Check Xcode and free disk space safely
         run: |
           df -h
+          LATEST_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -n "$LATEST_XCODE" ]; then
+            sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          fi
           ACTIVE_XCODE=$(xcode-select -p | sed 's|/Contents/Developer||')
           echo "Active Xcode: $ACTIVE_XCODE"
           xcodebuild -version
+          xcrun --show-sdk-version
           for app in /Applications/Xcode*.app; do
             if [ -d "$app" ] && [ "$app" != "$ACTIVE_XCODE" ] && [ ! -L "$app" ]; then
               echo "Removing unused $app"
