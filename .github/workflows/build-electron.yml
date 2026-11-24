@@ -118,6 +118,7 @@ jobs:
           symbol_level = 0
           blink_symbol_level = 0
           v8_symbol_level = 0
+          use_unified_system_module = false
           override_electron_version = "${ELECTRON_VERSION}"
           target_cpu = "${TARGET_ARCH}"
           EOF
