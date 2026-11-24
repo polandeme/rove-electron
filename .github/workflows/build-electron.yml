@@ -47,22 +47,34 @@ jobs:
 
       - name: Check Xcode and free disk space safely
         run: |
+          set -euo pipefail
           df -h
-          LATEST_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          if [ -n "$LATEST_XCODE" ]; then
-            sudo xcode-select -s "$LATEST_XCODE/Contents/Developer"
+          ls -la /Applications | grep -i xcode || true
+          TARGET_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
+          if [ -z "$TARGET_XCODE" ]; then
+            TARGET_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
           fi
-          ACTIVE_XCODE=$(xcode-select -p | sed 's|/Contents/Developer||')
-          echo "Active Xcode: $ACTIVE_XCODE"
+          if [ -z "$TARGET_XCODE" ] || [ ! -d "$TARGET_XCODE/Contents/Developer" ]; then
+            echo "ERROR: No Xcode.app found in /Applications" >&2
+            exit 1
+          fi
+          sudo xcode-select -s "$TARGET_XCODE/Contents/Developer"
+          ACTIVE_XCODE=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$TARGET_XCODE")
+          echo "Selected Xcode: $TARGET_XCODE (real: $ACTIVE_XCODE)"
           xcodebuild -version
           xcrun --show-sdk-version
           for app in /Applications/Xcode*.app; do
-            if [ -d "$app" ] && [ "$app" != "$ACTIVE_XCODE" ] && [ ! -L "$app" ]; then
+            [ -e "$app" ] || continue
+            REAL_APP=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app")
+            if [ "$REAL_APP" != "$ACTIVE_XCODE" ] && [ ! -L "$app" ]; then
               echo "Removing unused $app"
               sudo rm -rf "$app" || true
             fi
           done
           sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* "$HOME/Library/Android" /usr/local/share/dotnet 2>/dev/null || true
+          # Re-verify Xcode and SDK are intact before starting gclient sync
+          xcodebuild -version
+          xcrun --show-sdk-version
           df -h
 
       - name: Install depot_tools
