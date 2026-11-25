@@ -40,7 +40,7 @@ jobs:
       TARGET_ARCH: ${{ inputs.target_arch || 'arm64' }}
       DEPOT_TOOLS_UPDATE: '0'
       CCACHE_DIR: /Users/runner/.ccache
-      CCACHE_MAXSIZE: 6G
+      CCACHE_MAXSIZE: 7G
       CCACHE_COMPRESS: 'true'
       CCACHE_COMPRESSLEVEL: '3'
       CCACHE_CPP2: 'yes'
@@ -66,17 +66,15 @@ jobs:
           restore-keys: |
             ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-
 
+      - name: Show restored ccache stats
+        run: ccache -s || true
+
       - name: Check Xcode and free disk space safely
         run: |
           set -euo pipefail
-          df -h
           TARGET_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
           if [ -z "$TARGET_XCODE" ]; then
             TARGET_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          fi
-          if [ -z "$TARGET_XCODE" ] || [ ! -d "$TARGET_XCODE/Contents/Developer" ]; then
-            echo "ERROR: No Xcode.app found in /Applications" >&2
-            exit 1
           fi
           sudo xcode-select -s "$TARGET_XCODE/Contents/Developer"
           ACTIVE_XCODE=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$TARGET_XCODE")
@@ -156,14 +154,14 @@ jobs:
           EOF
           gn gen out/Release 2>&1 | tee "$WORK_DIR/last-step.log"
 
-      - name: Build Electron dist zip (Stage 1, -j 2, 220m soft budget)
+      - name: Build Electron dist zip (Stage 1, -j 2, 250m soft budget)
         id: ninja
         run: |
           cd "$WORK_DIR/src"
           set +e
           python3 -u - <<'PY'
           import os, signal, subprocess, sys, time
-          budget_sec = 220 * 60
+          budget_sec = 250 * 60
           log_path = os.path.join(os.environ['WORK_DIR'], 'last-step.log')
           start = time.monotonic()
           with open(log_path, 'w') as log:
@@ -180,7 +178,7 @@ jobs:
                   elif proc.poll() is not None:
                       break
                   if time.monotonic() - start >= budget_sec:
-                      print(f"\n[stage-1] Soft budget reached ({budget_sec}s), stopping ninja cleanly to save ccache...", flush=True)
+                      print(f"\n[stage-1] Soft budget reached ({budget_sec}s), stopping ninja cleanly...", flush=True)
                       proc.send_signal(signal.SIGINT)
                       try:
                           proc.wait(timeout=120)
@@ -202,13 +200,6 @@ jobs:
           else
             exit "$RC"
           fi
-
-      - name: Save ccache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s1
 
       - name: Verify built Electron sends TLS extension 0xCA34 (51764)
         if: steps.ninja.outputs.finished == 'true' && env.TARGET_ARCH == 'arm64'
@@ -239,20 +230,6 @@ jobs:
           EOF
           "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs" 2>&1 | tee "$WORK_DIR/last-step.log"
 
-      - name: Upload failure diagnostic log
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ -f "$WORK_DIR/last-step.log" ]; then
-            tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
-            if gh release view ci-debug-log >/dev/null 2>&1; then
-              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
-            else
-              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
-            fi
-          fi
-
       - name: Package and publish GitHub Release
         if: steps.ninja.outputs.finished == 'true'
         env:
@@ -272,6 +249,36 @@ jobs:
               --notes "Patched Electron v${ELECTRON_VERSION} populating compiled-in Chrome Root Store TLS Trust Anchor IDs (0xCA34 / 51764)."
           fi
 
+      - name: Upload failure diagnostic log
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f "$WORK_DIR/last-step.log" ]; then
+            tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
+            if gh release view ci-debug-log >/dev/null 2>&1; then
+              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
+            else
+              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
+            fi
+          fi
+
+      - name: Free build tree and tidy ccache before saving
+        if: always()
+        run: |
+          rm -rf "$WORK_DIR/src" "$WORK_DIR/verify"
+          find "$CCACHE_DIR" -name "*.tmp.*" -delete 2>/dev/null || true
+          ccache -c || true
+          du -sh "$CCACHE_DIR" || true
+          df -h
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/.ccache
+          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s1
+
   build-stage-2:
     needs: build-stage-1
     if: needs.build-stage-1.outputs.finished != 'true'
@@ -284,7 +291,7 @@ jobs:
       TARGET_ARCH: ${{ inputs.target_arch || 'arm64' }}
       DEPOT_TOOLS_UPDATE: '0'
       CCACHE_DIR: /Users/runner/.ccache
-      CCACHE_MAXSIZE: 6G
+      CCACHE_MAXSIZE: 7G
       CCACHE_COMPRESS: 'true'
       CCACHE_COMPRESSLEVEL: '3'
       CCACHE_CPP2: 'yes'
@@ -331,6 +338,7 @@ jobs:
           sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* "$HOME/Library/Android" /usr/local/share/dotnet 2>/dev/null || true
           xcodebuild -version
           xcrun --show-sdk-version
+          df -h
 
       - name: Install depot_tools
         run: |
@@ -396,14 +404,14 @@ jobs:
           EOF
           gn gen out/Release 2>&1 | tee "$WORK_DIR/last-step.log"
 
-      - name: Build Electron dist zip (Stage 2, -j 2, 220m soft budget)
+      - name: Build Electron dist zip (Stage 2, -j 2, 250m soft budget)
         id: ninja
         run: |
           cd "$WORK_DIR/src"
           set +e
           python3 -u - <<'PY'
           import os, signal, subprocess, sys, time
-          budget_sec = 220 * 60
+          budget_sec = 250 * 60
           log_path = os.path.join(os.environ['WORK_DIR'], 'last-step.log')
           start = time.monotonic()
           with open(log_path, 'w') as log:
@@ -420,7 +428,7 @@ jobs:
                   elif proc.poll() is not None:
                       break
                   if time.monotonic() - start >= budget_sec:
-                      print(f"\n[stage-2] Soft budget reached ({budget_sec}s), stopping ninja cleanly to save ccache...", flush=True)
+                      print(f"\n[stage-2] Soft budget reached ({budget_sec}s), stopping ninja cleanly...", flush=True)
                       proc.send_signal(signal.SIGINT)
                       try:
                           proc.wait(timeout=120)
@@ -442,13 +450,6 @@ jobs:
           else
             exit "$RC"
           fi
-
-      - name: Save ccache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s2
 
       - name: Verify built Electron sends TLS extension 0xCA34 (51764)
         if: steps.ninja.outputs.finished == 'true' && env.TARGET_ARCH == 'arm64'
@@ -479,20 +480,6 @@ jobs:
           EOF
           "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs" 2>&1 | tee "$WORK_DIR/last-step.log"
 
-      - name: Upload failure diagnostic log
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ -f "$WORK_DIR/last-step.log" ]; then
-            tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
-            if gh release view ci-debug-log >/dev/null 2>&1; then
-              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
-            else
-              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
-            fi
-          fi
-
       - name: Package and publish GitHub Release
         if: steps.ninja.outputs.finished == 'true'
         env:
@@ -512,6 +499,36 @@ jobs:
               --notes "Patched Electron v${ELECTRON_VERSION} populating compiled-in Chrome Root Store TLS Trust Anchor IDs (0xCA34 / 51764)."
           fi
 
+      - name: Upload failure diagnostic log
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f "$WORK_DIR/last-step.log" ]; then
+            tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
+            if gh release view ci-debug-log >/dev/null 2>&1; then
+              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
+            else
+              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
+            fi
+          fi
+
+      - name: Free build tree and tidy ccache before saving
+        if: always()
+        run: |
+          rm -rf "$WORK_DIR/src" "$WORK_DIR/verify"
+          find "$CCACHE_DIR" -name "*.tmp.*" -delete 2>/dev/null || true
+          ccache -c || true
+          du -sh "$CCACHE_DIR" || true
+          df -h
+
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/.ccache
+          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s2
+
   build-stage-3:
     needs: [build-stage-1, build-stage-2]
     if: always() && needs.build-stage-1.result == 'success' && needs.build-stage-1.outputs.finished != 'true' && needs.build-stage-2.result == 'success' && needs.build-stage-2.outputs.finished != 'true'
@@ -522,7 +539,7 @@ jobs:
       TARGET_ARCH: ${{ inputs.target_arch || 'arm64' }}
       DEPOT_TOOLS_UPDATE: '0'
       CCACHE_DIR: /Users/runner/.ccache
-      CCACHE_MAXSIZE: 6G
+      CCACHE_MAXSIZE: 7G
       CCACHE_COMPRESS: 'true'
       CCACHE_COMPRESSLEVEL: '3'
       CCACHE_CPP2: 'yes'
@@ -569,6 +586,7 @@ jobs:
           sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* "$HOME/Library/Android" /usr/local/share/dotnet 2>/dev/null || true
           xcodebuild -version
           xcrun --show-sdk-version
+          df -h
 
       - name: Install depot_tools
         run: |
@@ -634,16 +652,53 @@ jobs:
           EOF
           gn gen out/Release 2>&1 | tee "$WORK_DIR/last-step.log"
 
-      - name: Finish Electron dist zip (Stage 3, -j 2)
+      - name: Finish Electron dist zip (Stage 3, -j 2, 260m soft budget)
+        id: ninja
         run: |
-          set -o pipefail
           cd "$WORK_DIR/src"
-          ninja -j 2 -C out/Release electron:electron_dist_zip 2>&1 | tee "$WORK_DIR/last-step.log"
+          set +e
+          python3 -u - <<'PY'
+          import os, signal, subprocess, sys, time
+          budget_sec = 260 * 60
+          log_path = os.path.join(os.environ['WORK_DIR'], 'last-step.log')
+          start = time.monotonic()
+          with open(log_path, 'w') as log:
+              proc = subprocess.Popen(
+                  ['ninja', '-j', '2', '-C', 'out/Release', 'electron:electron_dist_zip'],
+                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
+              )
+              timed_out = False
+              while True:
+                  line = proc.stdout.readline()
+                  if line:
+                      sys.stdout.write(line)
+                      log.write(line)
+                  elif proc.poll() is not None:
+                      break
+                  if time.monotonic() - start >= budget_sec:
+                      print(f"\n[stage-3] Soft budget reached ({budget_sec}s), stopping ninja cleanly...", flush=True)
+                      proc.send_signal(signal.SIGINT)
+                      try:
+                          proc.wait(timeout=120)
+                      except subprocess.TimeoutExpired:
+                          proc.kill()
+                          proc.wait()
+                      timed_out = True
+                      break
+              sys.exit(124 if timed_out else proc.returncode)
+          PY
+          RC=$?
+          set -e
           ccache -s || true
-          ls -lh out/Release/dist.zip
+          if [ "$RC" -eq 0 ] && [ -f "$WORK_DIR/src/out/Release/dist.zip" ]; then
+            echo "finished=true" >> "$GITHUB_OUTPUT"
+            ls -lh "$WORK_DIR/src/out/Release/dist.zip"
+          else
+            exit "$RC"
+          fi
 
       - name: Verify built Electron sends TLS extension 0xCA34 (51764)
-        if: env.TARGET_ARCH == 'arm64'
+        if: steps.ninja.outputs.finished == 'true' && env.TARGET_ARCH == 'arm64'
         run: |
           set -o pipefail
           VERIFY_DIR="$WORK_DIR/verify"
@@ -671,28 +726,8 @@ jobs:
           EOF
           "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs" 2>&1 | tee "$WORK_DIR/last-step.log"
 
-      - name: Upload failure diagnostic log
-        if: failure()
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if [ -f "$WORK_DIR/last-step.log" ]; then
-            tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
-            if gh release view ci-debug-log >/dev/null 2>&1; then
-              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
-            else
-              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
-            fi
-          fi
-
-      - name: Save updated ccache
-        if: always()
-        uses: actions/cache/save@v4
-        with:
-          path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s3
-
       - name: Package and publish GitHub Release
+        if: steps.ninja.outputs.finished == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
@@ -709,3 +744,33 @@ jobs:
               --title "Electron v${ELECTRON_VERSION} (TLS Trust Anchor IDs)" \
               --notes "Patched Electron v${ELECTRON_VERSION} populating compiled-in Chrome Root Store TLS Trust Anchor IDs (0xCA34 / 51764)."
           fi
+
+      - name: Upload failure diagnostic log
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f "$WORK_DIR/last-step.log" ]; then
+            tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
+            if gh release view ci-debug-log >/dev/null 2>&1; then
+              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
+            else
+              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
+            fi
+          fi
+
+      - name: Free build tree and tidy ccache before saving
+        if: always()
+        run: |
+          rm -rf "$WORK_DIR/src" "$WORK_DIR/verify"
+          find "$CCACHE_DIR" -name "*.tmp.*" -delete 2>/dev/null || true
+          ccache -c || true
+          du -sh "$CCACHE_DIR" || true
+          df -h
+
+      - name: Save updated ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/.ccache
+          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s3
