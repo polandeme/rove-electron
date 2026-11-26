@@ -7,6 +7,7 @@ on:
     paths:
       - 'patches/**'
       - '.github/workflows/build-electron.yml'
+      - '.github/scripts/build-stage.sh'
   workflow_dispatch:
     inputs:
       electron_version:
@@ -29,241 +30,55 @@ concurrency:
   group: build-electron-${{ inputs.electron_version || '45.3.4' }}-${{ inputs.target_arch || 'arm64' }}
   cancel-in-progress: false
 
+env:
+  ELECTRON_VERSION: ${{ inputs.electron_version || '45.3.4' }}
+  TARGET_ARCH: ${{ inputs.target_arch || 'arm64' }}
+  DEPOT_TOOLS_UPDATE: '0'
+  CCACHE_DIR: /Users/runner/.ccache
+  CCACHE_MAXSIZE: 9G
+  CCACHE_COMPRESS: 'true'
+  CCACHE_COMPRESSLEVEL: '3'
+  CCACHE_CPP2: 'yes'
+  CCACHE_COMPILERCHECK: content
+  CCACHE_NOHASHDIR: 'true'
+  CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime,pch_defines,file_macro
+
 jobs:
   build-stage-1:
     runs-on: macos-26
     timeout-minutes: 360
     outputs:
-      finished: ${{ steps.ninja.outputs.finished }}
-    env:
-      ELECTRON_VERSION: ${{ inputs.electron_version || '45.3.4' }}
-      TARGET_ARCH: ${{ inputs.target_arch || 'arm64' }}
-      DEPOT_TOOLS_UPDATE: '0'
-      CCACHE_DIR: /Users/runner/.ccache
-      CCACHE_MAXSIZE: 7G
-      CCACHE_COMPRESS: 'true'
-      CCACHE_COMPRESSLEVEL: '3'
-      CCACHE_CPP2: 'yes'
-      CCACHE_NOHASHDIR: 'true'
-      CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
+      finished: ${{ steps.build.outputs.finished }}
     steps:
-      - name: Checkout patches
-        uses: actions/checkout@v4
-
-      - name: Initialize build directory and install ccache
+      - uses: actions/checkout@v4
+      - name: Initialize environment and ccache
         run: |
           echo "WORK_DIR=${RUNNER_TEMP}/electron-build" >> "$GITHUB_ENV"
           echo "CCACHE_BASEDIR=${RUNNER_TEMP}/electron-build/src" >> "$GITHUB_ENV"
           brew install ccache
           mkdir -p "$CCACHE_DIR"
-          ccache --version
-
       - name: Restore ccache
         uses: actions/cache/restore@v4
         with:
           path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s1
+          key: ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s1
           restore-keys: |
-            ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-
-
-      - name: Show restored ccache stats
-        run: ccache -s || true
-
-      - name: Check Xcode and free disk space safely
-        run: |
-          set -euo pipefail
-          TARGET_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          if [ -z "$TARGET_XCODE" ]; then
-            TARGET_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          fi
-          sudo xcode-select -s "$TARGET_XCODE/Contents/Developer"
-          ACTIVE_XCODE=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$TARGET_XCODE")
-          for app in /Applications/Xcode*.app; do
-            [ -e "$app" ] || continue
-            REAL_APP=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app")
-            if [ "$REAL_APP" != "$ACTIVE_XCODE" ] && [ ! -L "$app" ]; then
-              sudo rm -rf "$app" || true
-            fi
-          done
-          sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* "$HOME/Library/Android" /usr/local/share/dotnet 2>/dev/null || true
-          xcodebuild -version
-          xcrun --show-sdk-version
-          df -h
-
-      - name: Install depot_tools
-        run: |
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK_DIR/depot_tools"
-          echo "$WORK_DIR/depot_tools" >> "$GITHUB_PATH"
-          DEPOT_TOOLS_UPDATE=1 "$WORK_DIR/depot_tools/ensure_bootstrap"
-
-      - name: Sync Electron and Chromium
-        run: |
-          set -o pipefail
-          mkdir -p "$WORK_DIR/src"
-          cd "$WORK_DIR"
-          cat > .gclient <<EOF
-          solutions = [
-            {
-              "name": "src/electron",
-              "url": "https://github.com/electron/electron@v${ELECTRON_VERSION}",
-              "deps_file": "DEPS",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {
-                "checkout_pgo_profiles": False,
-                "checkout_src_internal": False,
-                "checkout_google_benchmark": False,
-                "checkout_telemetry_dependencies": False,
-              },
-            },
-          ]
-          EOF
-          gclient sync --with_branch_heads --with_tags --no-history --shallow --nohooks 2>&1 | tee "$WORK_DIR/last-step.log"
-          gclient runhooks 2>&1 | tee -a "$WORK_DIR/last-step.log"
-
-      - name: Install Electron JS dependencies and apply TLS Trust Anchor IDs patch
-        run: |
-          set -o pipefail
-          PATCH_FILE="$GITHUB_WORKSPACE/patches/electron/tls-trust-anchor-ids.patch"
-          cd "$WORK_DIR/src/electron"
-          git pack-refs --all
-          node script/yarn.js install --immutable --mode=skip-build 2>&1 | tee "$WORK_DIR/last-step.log"
-          git apply --check "$PATCH_FILE"
-          git apply "$PATCH_FILE"
-
-      - name: Generate GN build files
-        run: |
-          set -o pipefail
-          cd "$WORK_DIR/src"
-          mkdir -p out/Release
-          cat > out/Release/args.gn <<EOF
-          import("//electron/build/args/all.gn")
-          is_debug = false
-          is_component_build = false
-          is_component_ffmpeg = true
-          is_official_build = false
-          dcheck_always_on = false
-          symbol_level = 0
-          blink_symbol_level = 0
-          v8_symbol_level = 0
-          clang_use_chrome_plugins = false
-          cc_wrapper = "ccache"
-          use_unified_system_module = false
-          override_electron_version = "${ELECTRON_VERSION}"
-          target_cpu = "${TARGET_ARCH}"
-          EOF
-          gn gen out/Release 2>&1 | tee "$WORK_DIR/last-step.log"
-
-      - name: Build Electron dist zip (Stage 1, -j 2, 250m soft budget)
-        id: ninja
-        run: |
-          cd "$WORK_DIR/src"
-          set +e
-          python3 -u - <<'PY'
-          import os, signal, subprocess, sys, time
-          budget_sec = 250 * 60
-          log_path = os.path.join(os.environ['WORK_DIR'], 'last-step.log')
-          start = time.monotonic()
-          with open(log_path, 'w') as log:
-              proc = subprocess.Popen(
-                  ['ninja', '-j', '2', '-C', 'out/Release', 'electron:electron_dist_zip'],
-                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-              )
-              timed_out = False
-              while True:
-                  line = proc.stdout.readline()
-                  if line:
-                      sys.stdout.write(line)
-                      log.write(line)
-                  elif proc.poll() is not None:
-                      break
-                  if time.monotonic() - start >= budget_sec:
-                      print(f"\n[stage-1] Soft budget reached ({budget_sec}s), stopping ninja cleanly...", flush=True)
-                      proc.send_signal(signal.SIGINT)
-                      try:
-                          proc.wait(timeout=120)
-                      except subprocess.TimeoutExpired:
-                          proc.kill()
-                          proc.wait()
-                      timed_out = True
-                      break
-              sys.exit(124 if timed_out else proc.returncode)
-          PY
-          RC=$?
-          set -e
-          ccache -s || true
-          if [ "$RC" -eq 0 ] && [ -f "$WORK_DIR/src/out/Release/dist.zip" ]; then
-            echo "finished=true" >> "$GITHUB_OUTPUT"
-            ls -lh "$WORK_DIR/src/out/Release/dist.zip"
-          elif [ "$RC" -eq 124 ]; then
-            echo "finished=false" >> "$GITHUB_OUTPUT"
-          else
-            exit "$RC"
-          fi
-
-      - name: Verify built Electron sends TLS extension 0xCA34 (51764)
-        if: steps.ninja.outputs.finished == 'true' && env.TARGET_ARCH == 'arm64'
-        run: |
-          set -o pipefail
-          VERIFY_DIR="$WORK_DIR/verify"
-          mkdir -p "$VERIFY_DIR"
-          ditto -x -k "$WORK_DIR/src/out/Release/dist.zip" "$VERIFY_DIR"
-          cat > "$VERIFY_DIR/check-tls.cjs" <<'EOF'
-          const { app, BrowserWindow, session } = require('electron');
-          app.on('window-all-closed', () => {});
-          app.whenReady().then(async () => {
-            const ses = session.fromPartition('ci-tls-check');
-            const win = new BrowserWindow({ show: false, webPreferences: { session: ses, sandbox: true } });
-            try {
-              await win.loadURL('https://tls.peet.ws/api/all');
-              const raw = await win.webContents.mainFrame.executeJavaScript('document.body.innerText');
-              const data = JSON.parse(raw);
-              const has51764 = (data.tls?.extensions || []).some(e => /51764|trust_anchor/i.test(e.name));
-              console.log('JA4:', data.tls?.ja4, 'HAS_51764:', has51764);
-              win.destroy();
-              app.exit(has51764 ? 0 : 1);
-            } catch (err) {
-              console.error(err);
-              app.exit(1);
-            }
-          });
-          EOF
-          "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs" 2>&1 | tee "$WORK_DIR/last-step.log"
-
-      - name: Package and publish GitHub Release
-        if: steps.ninja.outputs.finished == 'true'
+            ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-
+      - name: Run Stage 1
+        id: build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          OUT_DIR="$WORK_DIR/artifacts"
-          mkdir -p "$OUT_DIR"
-          ZIP_NAME="electron-v${ELECTRON_VERSION}-darwin-${TARGET_ARCH}.zip"
-          cp "$WORK_DIR/src/out/Release/dist.zip" "$OUT_DIR/$ZIP_NAME"
-          (cd "$OUT_DIR" && shasum -a 256 "$ZIP_NAME" > SHASUMS256.txt)
-          TAG="v${ELECTRON_VERSION}-tai"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$OUT_DIR"/* --clobber
-          else
-            gh release create "$TAG" "$OUT_DIR"/* \
-              --title "Electron v${ELECTRON_VERSION} (TLS Trust Anchor IDs)" \
-              --notes "Patched Electron v${ELECTRON_VERSION} populating compiled-in Chrome Root Store TLS Trust Anchor IDs (0xCA34 / 51764)."
-          fi
-
-      - name: Upload failure diagnostic log
+        run: bash .github/scripts/build-stage.sh stage-1 250
+      - name: Upload failure log
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -f "$WORK_DIR/last-step.log" ]; then
             tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
-            if gh release view ci-debug-log >/dev/null 2>&1; then
-              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
-            else
-              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
-            fi
+            gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Failure tail" || true
           fi
-
-      - name: Free build tree and tidy ccache before saving
+      - name: Free build tree and tidy ccache
         if: always()
         run: |
           rm -rf "$WORK_DIR/src" "$WORK_DIR/verify"
@@ -271,13 +86,12 @@ jobs:
           ccache -c || true
           du -sh "$CCACHE_DIR" || true
           df -h
-
       - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s1
+          key: ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s1
 
   build-stage-2:
     needs: build-stage-1
@@ -285,235 +99,37 @@ jobs:
     runs-on: macos-26
     timeout-minutes: 360
     outputs:
-      finished: ${{ steps.ninja.outputs.finished }}
-    env:
-      ELECTRON_VERSION: ${{ inputs.electron_version || '45.3.4' }}
-      TARGET_ARCH: ${{ inputs.target_arch || 'arm64' }}
-      DEPOT_TOOLS_UPDATE: '0'
-      CCACHE_DIR: /Users/runner/.ccache
-      CCACHE_MAXSIZE: 7G
-      CCACHE_COMPRESS: 'true'
-      CCACHE_COMPRESSLEVEL: '3'
-      CCACHE_CPP2: 'yes'
-      CCACHE_NOHASHDIR: 'true'
-      CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
+      finished: ${{ steps.build.outputs.finished }}
     steps:
-      - name: Checkout patches
-        uses: actions/checkout@v4
-
-      - name: Initialize build directory and install ccache
+      - uses: actions/checkout@v4
+      - name: Initialize environment and ccache
         run: |
           echo "WORK_DIR=${RUNNER_TEMP}/electron-build" >> "$GITHUB_ENV"
           echo "CCACHE_BASEDIR=${RUNNER_TEMP}/electron-build/src" >> "$GITHUB_ENV"
           brew install ccache
           mkdir -p "$CCACHE_DIR"
-
       - name: Restore ccache from Stage 1
         uses: actions/cache/restore@v4
         with:
           path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s1
+          key: ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s1
           restore-keys: |
-            ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-
-
-      - name: Show restored ccache stats
-        run: ccache -s || true
-
-      - name: Check Xcode and free disk space safely
-        run: |
-          set -euo pipefail
-          TARGET_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          if [ -z "$TARGET_XCODE" ]; then
-            TARGET_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          fi
-          sudo xcode-select -s "$TARGET_XCODE/Contents/Developer"
-          ACTIVE_XCODE=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$TARGET_XCODE")
-          for app in /Applications/Xcode*.app; do
-            [ -e "$app" ] || continue
-            REAL_APP=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app")
-            if [ "$REAL_APP" != "$ACTIVE_XCODE" ] && [ ! -L "$app" ]; then
-              sudo rm -rf "$app" || true
-            fi
-          done
-          sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* "$HOME/Library/Android" /usr/local/share/dotnet 2>/dev/null || true
-          xcodebuild -version
-          xcrun --show-sdk-version
-          df -h
-
-      - name: Install depot_tools
-        run: |
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK_DIR/depot_tools"
-          echo "$WORK_DIR/depot_tools" >> "$GITHUB_PATH"
-          DEPOT_TOOLS_UPDATE=1 "$WORK_DIR/depot_tools/ensure_bootstrap"
-
-      - name: Sync Electron and Chromium
-        run: |
-          set -o pipefail
-          mkdir -p "$WORK_DIR/src"
-          cd "$WORK_DIR"
-          cat > .gclient <<EOF
-          solutions = [
-            {
-              "name": "src/electron",
-              "url": "https://github.com/electron/electron@v${ELECTRON_VERSION}",
-              "deps_file": "DEPS",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {
-                "checkout_pgo_profiles": False,
-                "checkout_src_internal": False,
-                "checkout_google_benchmark": False,
-                "checkout_telemetry_dependencies": False,
-              },
-            },
-          ]
-          EOF
-          gclient sync --with_branch_heads --with_tags --no-history --shallow --nohooks 2>&1 | tee "$WORK_DIR/last-step.log"
-          gclient runhooks 2>&1 | tee -a "$WORK_DIR/last-step.log"
-
-      - name: Install Electron JS dependencies and apply TLS Trust Anchor IDs patch
-        run: |
-          set -o pipefail
-          PATCH_FILE="$GITHUB_WORKSPACE/patches/electron/tls-trust-anchor-ids.patch"
-          cd "$WORK_DIR/src/electron"
-          git pack-refs --all
-          node script/yarn.js install --immutable --mode=skip-build 2>&1 | tee "$WORK_DIR/last-step.log"
-          git apply --check "$PATCH_FILE"
-          git apply "$PATCH_FILE"
-
-      - name: Generate GN build files
-        run: |
-          set -o pipefail
-          cd "$WORK_DIR/src"
-          mkdir -p out/Release
-          cat > out/Release/args.gn <<EOF
-          import("//electron/build/args/all.gn")
-          is_debug = false
-          is_component_build = false
-          is_component_ffmpeg = true
-          is_official_build = false
-          dcheck_always_on = false
-          symbol_level = 0
-          blink_symbol_level = 0
-          v8_symbol_level = 0
-          clang_use_chrome_plugins = false
-          cc_wrapper = "ccache"
-          use_unified_system_module = false
-          override_electron_version = "${ELECTRON_VERSION}"
-          target_cpu = "${TARGET_ARCH}"
-          EOF
-          gn gen out/Release 2>&1 | tee "$WORK_DIR/last-step.log"
-
-      - name: Build Electron dist zip (Stage 2, -j 2, 250m soft budget)
-        id: ninja
-        run: |
-          cd "$WORK_DIR/src"
-          set +e
-          python3 -u - <<'PY'
-          import os, signal, subprocess, sys, time
-          budget_sec = 250 * 60
-          log_path = os.path.join(os.environ['WORK_DIR'], 'last-step.log')
-          start = time.monotonic()
-          with open(log_path, 'w') as log:
-              proc = subprocess.Popen(
-                  ['ninja', '-j', '2', '-C', 'out/Release', 'electron:electron_dist_zip'],
-                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-              )
-              timed_out = False
-              while True:
-                  line = proc.stdout.readline()
-                  if line:
-                      sys.stdout.write(line)
-                      log.write(line)
-                  elif proc.poll() is not None:
-                      break
-                  if time.monotonic() - start >= budget_sec:
-                      print(f"\n[stage-2] Soft budget reached ({budget_sec}s), stopping ninja cleanly...", flush=True)
-                      proc.send_signal(signal.SIGINT)
-                      try:
-                          proc.wait(timeout=120)
-                      except subprocess.TimeoutExpired:
-                          proc.kill()
-                          proc.wait()
-                      timed_out = True
-                      break
-              sys.exit(124 if timed_out else proc.returncode)
-          PY
-          RC=$?
-          set -e
-          ccache -s || true
-          if [ "$RC" -eq 0 ] && [ -f "$WORK_DIR/src/out/Release/dist.zip" ]; then
-            echo "finished=true" >> "$GITHUB_OUTPUT"
-            ls -lh "$WORK_DIR/src/out/Release/dist.zip"
-          elif [ "$RC" -eq 124 ]; then
-            echo "finished=false" >> "$GITHUB_OUTPUT"
-          else
-            exit "$RC"
-          fi
-
-      - name: Verify built Electron sends TLS extension 0xCA34 (51764)
-        if: steps.ninja.outputs.finished == 'true' && env.TARGET_ARCH == 'arm64'
-        run: |
-          set -o pipefail
-          VERIFY_DIR="$WORK_DIR/verify"
-          mkdir -p "$VERIFY_DIR"
-          ditto -x -k "$WORK_DIR/src/out/Release/dist.zip" "$VERIFY_DIR"
-          cat > "$VERIFY_DIR/check-tls.cjs" <<'EOF'
-          const { app, BrowserWindow, session } = require('electron');
-          app.on('window-all-closed', () => {});
-          app.whenReady().then(async () => {
-            const ses = session.fromPartition('ci-tls-check');
-            const win = new BrowserWindow({ show: false, webPreferences: { session: ses, sandbox: true } });
-            try {
-              await win.loadURL('https://tls.peet.ws/api/all');
-              const raw = await win.webContents.mainFrame.executeJavaScript('document.body.innerText');
-              const data = JSON.parse(raw);
-              const has51764 = (data.tls?.extensions || []).some(e => /51764|trust_anchor/i.test(e.name));
-              console.log('JA4:', data.tls?.ja4, 'HAS_51764:', has51764);
-              win.destroy();
-              app.exit(has51764 ? 0 : 1);
-            } catch (err) {
-              console.error(err);
-              app.exit(1);
-            }
-          });
-          EOF
-          "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs" 2>&1 | tee "$WORK_DIR/last-step.log"
-
-      - name: Package and publish GitHub Release
-        if: steps.ninja.outputs.finished == 'true'
+            ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-
+      - name: Run Stage 2
+        id: build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          OUT_DIR="$WORK_DIR/artifacts"
-          mkdir -p "$OUT_DIR"
-          ZIP_NAME="electron-v${ELECTRON_VERSION}-darwin-${TARGET_ARCH}.zip"
-          cp "$WORK_DIR/src/out/Release/dist.zip" "$OUT_DIR/$ZIP_NAME"
-          (cd "$OUT_DIR" && shasum -a 256 "$ZIP_NAME" > SHASUMS256.txt)
-          TAG="v${ELECTRON_VERSION}-tai"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$OUT_DIR"/* --clobber
-          else
-            gh release create "$TAG" "$OUT_DIR"/* \
-              --title "Electron v${ELECTRON_VERSION} (TLS Trust Anchor IDs)" \
-              --notes "Patched Electron v${ELECTRON_VERSION} populating compiled-in Chrome Root Store TLS Trust Anchor IDs (0xCA34 / 51764)."
-          fi
-
-      - name: Upload failure diagnostic log
+        run: bash .github/scripts/build-stage.sh stage-2 250
+      - name: Upload failure log
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -f "$WORK_DIR/last-step.log" ]; then
             tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
-            if gh release view ci-debug-log >/dev/null 2>&1; then
-              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
-            else
-              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
-            fi
+            gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
           fi
-
-      - name: Free build tree and tidy ccache before saving
+      - name: Free build tree and tidy ccache
         if: always()
         run: |
           rm -rf "$WORK_DIR/src" "$WORK_DIR/verify"
@@ -521,245 +137,50 @@ jobs:
           ccache -c || true
           du -sh "$CCACHE_DIR" || true
           df -h
-
       - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s2
+          key: ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s2
 
   build-stage-3:
     needs: [build-stage-1, build-stage-2]
     if: always() && needs.build-stage-1.result == 'success' && needs.build-stage-1.outputs.finished != 'true' && needs.build-stage-2.result == 'success' && needs.build-stage-2.outputs.finished != 'true'
     runs-on: macos-26
     timeout-minutes: 360
-    env:
-      ELECTRON_VERSION: ${{ inputs.electron_version || '45.3.4' }}
-      TARGET_ARCH: ${{ inputs.target_arch || 'arm64' }}
-      DEPOT_TOOLS_UPDATE: '0'
-      CCACHE_DIR: /Users/runner/.ccache
-      CCACHE_MAXSIZE: 7G
-      CCACHE_COMPRESS: 'true'
-      CCACHE_COMPRESSLEVEL: '3'
-      CCACHE_CPP2: 'yes'
-      CCACHE_NOHASHDIR: 'true'
-      CCACHE_SLOPPINESS: time_macros,include_file_mtime,include_file_ctime
+    outputs:
+      finished: ${{ steps.build.outputs.finished }}
     steps:
-      - name: Checkout patches
-        uses: actions/checkout@v4
-
-      - name: Initialize build directory and install ccache
+      - uses: actions/checkout@v4
+      - name: Initialize environment and ccache
         run: |
           echo "WORK_DIR=${RUNNER_TEMP}/electron-build" >> "$GITHUB_ENV"
           echo "CCACHE_BASEDIR=${RUNNER_TEMP}/electron-build/src" >> "$GITHUB_ENV"
           brew install ccache
           mkdir -p "$CCACHE_DIR"
-
       - name: Restore ccache from Stage 2
         uses: actions/cache/restore@v4
         with:
           path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s2
+          key: ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s2
           restore-keys: |
-            ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-
-
-      - name: Show restored ccache stats
-        run: ccache -s || true
-
-      - name: Check Xcode and free disk space safely
-        run: |
-          set -euo pipefail
-          TARGET_XCODE=$(ls -d /Applications/Xcode_26*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          if [ -z "$TARGET_XCODE" ]; then
-            TARGET_XCODE=$(ls -d /Applications/Xcode*.app 2>/dev/null | sort -V | tail -n 1 || true)
-          fi
-          sudo xcode-select -s "$TARGET_XCODE/Contents/Developer"
-          ACTIVE_XCODE=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$TARGET_XCODE")
-          for app in /Applications/Xcode*.app; do
-            [ -e "$app" ] || continue
-            REAL_APP=$(python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "$app")
-            if [ "$REAL_APP" != "$ACTIVE_XCODE" ] && [ ! -L "$app" ]; then
-              sudo rm -rf "$app" || true
-            fi
-          done
-          sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* "$HOME/Library/Android" /usr/local/share/dotnet 2>/dev/null || true
-          xcodebuild -version
-          xcrun --show-sdk-version
-          df -h
-
-      - name: Install depot_tools
-        run: |
-          git clone --depth 1 https://chromium.googlesource.com/chromium/tools/depot_tools.git "$WORK_DIR/depot_tools"
-          echo "$WORK_DIR/depot_tools" >> "$GITHUB_PATH"
-          DEPOT_TOOLS_UPDATE=1 "$WORK_DIR/depot_tools/ensure_bootstrap"
-
-      - name: Sync Electron and Chromium
-        run: |
-          set -o pipefail
-          mkdir -p "$WORK_DIR/src"
-          cd "$WORK_DIR"
-          cat > .gclient <<EOF
-          solutions = [
-            {
-              "name": "src/electron",
-              "url": "https://github.com/electron/electron@v${ELECTRON_VERSION}",
-              "deps_file": "DEPS",
-              "managed": False,
-              "custom_deps": {},
-              "custom_vars": {
-                "checkout_pgo_profiles": False,
-                "checkout_src_internal": False,
-                "checkout_google_benchmark": False,
-                "checkout_telemetry_dependencies": False,
-              },
-            },
-          ]
-          EOF
-          gclient sync --with_branch_heads --with_tags --no-history --shallow --nohooks 2>&1 | tee "$WORK_DIR/last-step.log"
-          gclient runhooks 2>&1 | tee -a "$WORK_DIR/last-step.log"
-
-      - name: Install Electron JS dependencies and apply TLS Trust Anchor IDs patch
-        run: |
-          set -o pipefail
-          PATCH_FILE="$GITHUB_WORKSPACE/patches/electron/tls-trust-anchor-ids.patch"
-          cd "$WORK_DIR/src/electron"
-          git pack-refs --all
-          node script/yarn.js install --immutable --mode=skip-build 2>&1 | tee "$WORK_DIR/last-step.log"
-          git apply --check "$PATCH_FILE"
-          git apply "$PATCH_FILE"
-
-      - name: Generate GN build files
-        run: |
-          set -o pipefail
-          cd "$WORK_DIR/src"
-          mkdir -p out/Release
-          cat > out/Release/args.gn <<EOF
-          import("//electron/build/args/all.gn")
-          is_debug = false
-          is_component_build = false
-          is_component_ffmpeg = true
-          is_official_build = false
-          dcheck_always_on = false
-          symbol_level = 0
-          blink_symbol_level = 0
-          v8_symbol_level = 0
-          clang_use_chrome_plugins = false
-          cc_wrapper = "ccache"
-          use_unified_system_module = false
-          override_electron_version = "${ELECTRON_VERSION}"
-          target_cpu = "${TARGET_ARCH}"
-          EOF
-          gn gen out/Release 2>&1 | tee "$WORK_DIR/last-step.log"
-
-      - name: Finish Electron dist zip (Stage 3, -j 2, 260m soft budget)
-        id: ninja
-        run: |
-          cd "$WORK_DIR/src"
-          set +e
-          python3 -u - <<'PY'
-          import os, signal, subprocess, sys, time
-          budget_sec = 260 * 60
-          log_path = os.path.join(os.environ['WORK_DIR'], 'last-step.log')
-          start = time.monotonic()
-          with open(log_path, 'w') as log:
-              proc = subprocess.Popen(
-                  ['ninja', '-j', '2', '-C', 'out/Release', 'electron:electron_dist_zip'],
-                  stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1
-              )
-              timed_out = False
-              while True:
-                  line = proc.stdout.readline()
-                  if line:
-                      sys.stdout.write(line)
-                      log.write(line)
-                  elif proc.poll() is not None:
-                      break
-                  if time.monotonic() - start >= budget_sec:
-                      print(f"\n[stage-3] Soft budget reached ({budget_sec}s), stopping ninja cleanly...", flush=True)
-                      proc.send_signal(signal.SIGINT)
-                      try:
-                          proc.wait(timeout=120)
-                      except subprocess.TimeoutExpired:
-                          proc.kill()
-                          proc.wait()
-                      timed_out = True
-                      break
-              sys.exit(124 if timed_out else proc.returncode)
-          PY
-          RC=$?
-          set -e
-          ccache -s || true
-          if [ "$RC" -eq 0 ] && [ -f "$WORK_DIR/src/out/Release/dist.zip" ]; then
-            echo "finished=true" >> "$GITHUB_OUTPUT"
-            ls -lh "$WORK_DIR/src/out/Release/dist.zip"
-          else
-            exit "$RC"
-          fi
-
-      - name: Verify built Electron sends TLS extension 0xCA34 (51764)
-        if: steps.ninja.outputs.finished == 'true' && env.TARGET_ARCH == 'arm64'
-        run: |
-          set -o pipefail
-          VERIFY_DIR="$WORK_DIR/verify"
-          mkdir -p "$VERIFY_DIR"
-          ditto -x -k "$WORK_DIR/src/out/Release/dist.zip" "$VERIFY_DIR"
-          cat > "$VERIFY_DIR/check-tls.cjs" <<'EOF'
-          const { app, BrowserWindow, session } = require('electron');
-          app.on('window-all-closed', () => {});
-          app.whenReady().then(async () => {
-            const ses = session.fromPartition('ci-tls-check');
-            const win = new BrowserWindow({ show: false, webPreferences: { session: ses, sandbox: true } });
-            try {
-              await win.loadURL('https://tls.peet.ws/api/all');
-              const raw = await win.webContents.mainFrame.executeJavaScript('document.body.innerText');
-              const data = JSON.parse(raw);
-              const has51764 = (data.tls?.extensions || []).some(e => /51764|trust_anchor/i.test(e.name));
-              console.log('JA4:', data.tls?.ja4, 'HAS_51764:', has51764);
-              win.destroy();
-              app.exit(has51764 ? 0 : 1);
-            } catch (err) {
-              console.error(err);
-              app.exit(1);
-            }
-          });
-          EOF
-          "$VERIFY_DIR/Electron.app/Contents/MacOS/Electron" "$VERIFY_DIR/check-tls.cjs" 2>&1 | tee "$WORK_DIR/last-step.log"
-
-      - name: Package and publish GitHub Release
-        if: steps.ninja.outputs.finished == 'true'
+            ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-
+      - name: Run Stage 3
+        id: build
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          OUT_DIR="$WORK_DIR/artifacts"
-          mkdir -p "$OUT_DIR"
-          ZIP_NAME="electron-v${ELECTRON_VERSION}-darwin-${TARGET_ARCH}.zip"
-          cp "$WORK_DIR/src/out/Release/dist.zip" "$OUT_DIR/$ZIP_NAME"
-          (cd "$OUT_DIR" && shasum -a 256 "$ZIP_NAME" > SHASUMS256.txt)
-          TAG="v${ELECTRON_VERSION}-tai"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "$OUT_DIR"/* --clobber
-          else
-            gh release create "$TAG" "$OUT_DIR"/* \
-              --title "Electron v${ELECTRON_VERSION} (TLS Trust Anchor IDs)" \
-              --notes "Patched Electron v${ELECTRON_VERSION} populating compiled-in Chrome Root Store TLS Trust Anchor IDs (0xCA34 / 51764)."
-          fi
-
-      - name: Upload failure diagnostic log
+        run: bash .github/scripts/build-stage.sh stage-3 250
+      - name: Upload failure log
         if: failure()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           if [ -f "$WORK_DIR/last-step.log" ]; then
             tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
-            if gh release view ci-debug-log >/dev/null 2>&1; then
-              gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
-            else
-              gh release create ci-debug-log "$WORK_DIR/failure-tail.txt" --prerelease --title "CI Debug Log" --notes "Latest failed step tail" || true
-            fi
+            gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
           fi
-
-      - name: Free build tree and tidy ccache before saving
+      - name: Free build tree and tidy ccache
         if: always()
         run: |
           rm -rf "$WORK_DIR/src" "$WORK_DIR/verify"
@@ -767,10 +188,58 @@ jobs:
           ccache -c || true
           du -sh "$CCACHE_DIR" || true
           df -h
-
-      - name: Save updated ccache
+      - name: Save ccache
         if: always()
         uses: actions/cache/save@v4
         with:
           path: /Users/runner/.ccache
-          key: ccache-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s3
+          key: ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s3
+
+  build-stage-4:
+    needs: [build-stage-1, build-stage-2, build-stage-3]
+    if: always() && needs.build-stage-1.result == 'success' && needs.build-stage-1.outputs.finished != 'true' && needs.build-stage-2.result == 'success' && needs.build-stage-2.outputs.finished != 'true' && needs.build-stage-3.result == 'success' && needs.build-stage-3.outputs.finished != 'true'
+    runs-on: macos-26
+    timeout-minutes: 360
+    steps:
+      - uses: actions/checkout@v4
+      - name: Initialize environment and ccache
+        run: |
+          echo "WORK_DIR=${RUNNER_TEMP}/electron-build" >> "$GITHUB_ENV"
+          echo "CCACHE_BASEDIR=${RUNNER_TEMP}/electron-build/src" >> "$GITHUB_ENV"
+          brew install ccache
+          mkdir -p "$CCACHE_DIR"
+      - name: Restore ccache from Stage 3
+        uses: actions/cache/restore@v4
+        with:
+          path: /Users/runner/.ccache
+          key: ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s3
+          restore-keys: |
+            ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-
+      - name: Run Stage 4
+        id: build
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash .github/scripts/build-stage.sh stage-4 270
+      - name: Upload failure log
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ -f "$WORK_DIR/last-step.log" ]; then
+            tail -n 200 "$WORK_DIR/last-step.log" > "$WORK_DIR/failure-tail.txt"
+            gh release upload ci-debug-log "$WORK_DIR/failure-tail.txt" --clobber || true
+          fi
+      - name: Free build tree and tidy ccache
+        if: always()
+        run: |
+          rm -rf "$WORK_DIR/src" "$WORK_DIR/verify"
+          find "$CCACHE_DIR" -name "*.tmp.*" -delete 2>/dev/null || true
+          ccache -c || true
+          du -sh "$CCACHE_DIR" || true
+          df -h
+      - name: Save ccache
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: /Users/runner/.ccache
+          key: ccache-c2-v${{ env.ELECTRON_VERSION }}-${{ env.TARGET_ARCH }}-${{ github.run_id }}-s4
